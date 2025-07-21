@@ -25,17 +25,17 @@ from io import BytesIO
 from timeit import default_timer as timer
 
 import numpy as np
-import pdfplumber
+import pdfplumber # PDF解析库
 import trio
 import xgboost as xgb
 from huggingface_hub import snapshot_download
-from PIL import Image
-from pypdf import PdfReader as pdf2_read
+from PIL import Image # 图像库
+from pypdf import PdfReader as pdf2_read    # PDF基础操作库
 
 from api import settings
 from api.utils.file_utils import get_project_base_directory
-from deepdoc.vision import OCR, LayoutRecognizer, Recognizer, TableStructureRecognizer
-from rag.app.picture import vision_llm_chunk as picture_vision_llm_chunk
+from deepdoc.vision import OCR, LayoutRecognizer, Recognizer, TableStructureRecognizer # OCR, 布局识别, 表格识别
+from rag.app.picture import vision_llm_chunk as picture_vision_llm_chunk # 视觉LLM分块
 from rag.nlp import rag_tokenizer
 from rag.prompts import vision_llm_describe_prompt
 from rag.settings import PARALLEL_DEVICES
@@ -60,31 +60,48 @@ class RAGFlowPdfParser:
         """
 
         self.ocr = OCR()
+
+        # 配置了多少个设备（比如 CPU 核或 GPU）用于并行处理。
         self.parallel_limiter = None
         if PARALLEL_DEVICES > 1:
+            # 如果 PARALLEL_DEVICES 大于 1，这行代码会创建一个列表，其中包含 PARALLEL_DEVICES 个 trio.CapacityLimiter 实例。
+            # trio.CapacityLimiter(1) 是 trio 异步并发库提供的一个工具，用于限制并发操作的数量。每个 CapacityLimiter(1) 意味着每次只能有一个任务通过这个限制器。
+            # 当处理 PDF 这种可能耗时的任务时，RAGFlow 可能希望同时利用多个设备来加速。但直接启动大量任务可能会耗尽资源。trio.CapacityLimiter 允许开发者限制在任何给定时间有多少个并行任务可以运行在特定的设备上，从而防止资源过度使用，提高稳定性和性能。
             self.parallel_limiter = [trio.CapacityLimiter(1) for _ in range(PARALLEL_DEVICES)]
 
+        # 检查当前 RAGFlowPdfParser 对象是否具有一个名为 model_speciess 的属性。hasattr() 是 Python 的内置函数。
+        # LayoutRecognizer() 是 deepdoc.vision 模块中的另一个类，用于识别文档的页面布局（例如，段落、标题、列表等的位置和结构）。通过传入一个带特定后缀的字符串，它可能加载与该模型类型兼容的布局识别模型或配置。
         if hasattr(self, "model_speciess"):
             self.layouter = LayoutRecognizer("layout." + self.model_speciess)
         else:
+            # 加载一个通用的布局识别模型或配置。
             self.layouter = LayoutRecognizer("layout")
+
+        # 专门用于识别 PDF 或图像中的表格结构。
         self.tbl_det = TableStructureRecognizer()
 
+        # xgb.Booster 是 XGBoost 模型的核心数据结构，用于加载和使用预训练的 XGBoost 模型。
         self.updown_cnt_mdl = xgb.Booster()
+
+        # 用于控制是否启用“轻量级”模式（即不加载大型模型或不使用 GPU）。
         if not settings.LIGHTEN:
             try:
                 import torch.cuda
                 if torch.cuda.is_available():
+                    # 如果 GPU 可用，将 XGBoost 模型的计算设备设置为 cuda（即 GPU）。为了将 XGBoost 模型（self.updown_cnt_mdl）的计算offload 到 GPU 上，以加速推理过程。XGBoost 可以利用 GPU 进行计算，从而显著提高性能。
                     self.updown_cnt_mdl.set_param({"device": "cuda"})
             except Exception:
                 logging.exception("RAGFlowPdfParser __init__")
         try:
+            # 构建模型文件的本地存储路径。get_project_base_directory() 是一个辅助函数，用于获取项目的根目录。
             model_dir = os.path.join(
                 get_project_base_directory(),
                 "rag/res/deepdoc")
+            # 从本地路径加载预训练的 XGBoost 模型文件。
             self.updown_cnt_mdl.load_model(os.path.join(
                 model_dir, "updown_concat_xgb.model"))
         except Exception:
+            # 如果在本地路径加载模型失败（例如，文件不存在或损坏）,调用 huggingface_hub.snapshot_download 函数从 Hugging Face 模型库下载模型。
             model_dir = snapshot_download(
                 repo_id="InfiniFlow/text_concat_xgb_v1.0",
                 local_dir=os.path.join(get_project_base_directory(), "rag/res/deepdoc"),
@@ -92,6 +109,7 @@ class RAGFlowPdfParser:
             self.updown_cnt_mdl.load_model(os.path.join(
                 model_dir, "updown_concat_xgb.model"))
 
+        # 用于记录从哪一页开始处理 PDF。
         self.page_from = 0
 
     def __char_width(self, c):
