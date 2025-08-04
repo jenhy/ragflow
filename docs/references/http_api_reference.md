@@ -1725,6 +1725,7 @@ Retrieves chunks from specified datasets.
   - `"rerank_id"`: `string`  
   - `"keyword"`: `boolean`  
   - `"highlight"`: `boolean`
+  - `"cross_languages"`: `list[string]`  
 
 ##### Request example
 
@@ -1769,6 +1770,8 @@ curl --request POST \
   Specifies whether to enable highlighting of matched terms in the results:  
   - `true`: Enable highlighting of matched terms.
   - `false`: Disable highlighting of matched terms (default).
+- `"cross_languages"`: (*Body parameter*) `list[string]`  
+  The languages that should be translated into, in order to achieve keywords retrievals in different languages.
 
 #### Response
 
@@ -3368,6 +3371,7 @@ The chat model autonomously determines the number of questions to generate based
   - `'Authorization: Bearer <YOUR_LOGIN_TOKEN>'`
 - Body:
   - `"question"`: `string`
+  - `"industry"`: `string`
 
 ##### Request example
 
@@ -3378,7 +3382,8 @@ curl --request POST \
      --header 'Authorization: Bearer <YOUR_LOGIN_TOKEN>' \
      --data '
      {
-          "question": "What are the key advantages of Neovim over Vim?"
+          "question": "What are the key advantages of Neovim over Vim?",
+          "industry": "software_development"
      }'
 ```
 
@@ -3386,6 +3391,8 @@ curl --request POST \
 
 - `"question"`: (*Body Parameter*), `string`
   The original user question.
+- `"industry"`: (*Body Parameter*), `string`
+  Industry of the question.
 
 #### Response
 

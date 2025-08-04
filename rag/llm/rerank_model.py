@@ -89,7 +89,7 @@ class DefaultRerank(Base):
 
             torch.cuda.empty_cache()
         except Exception as e:
-            print(f"Error emptying cache: {e}")
+            log_exception(e)
 
     def _process_batch(self, pairs, max_batch_size=None):
         """template method for subclass call"""
@@ -358,7 +358,7 @@ class OpenAI_APIRerank(Base):
         max_rank = np.max(rank)
 
         # Avoid division by zero if all ranks are identical
-        if max_rank - min_rank != 0:
+        if np.isclose(min_rank, max_rank, atol=1e-3):
             rank = (rank - min_rank) / (max_rank - min_rank)
         else:
             rank = np.zeros_like(rank)
@@ -616,4 +616,13 @@ class GiteeRerank(JinaRerank):
     def __init__(self, key, model_name, base_url="https://ai.gitee.com/v1/rerank"):
         if not base_url:
             base_url = "https://ai.gitee.com/v1/rerank"
+        super().__init__(key, model_name, base_url)
+
+
+class Ai302Rerank(Base):
+    _FACTORY_NAME = "302.AI"
+
+    def __init__(self, key, model_name, base_url="https://api.302.ai/v1/rerank"):
+        if not base_url:
+            base_url = "https://api.302.ai/v1/rerank"
         super().__init__(key, model_name, base_url)
