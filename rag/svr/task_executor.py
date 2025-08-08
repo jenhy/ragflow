@@ -742,6 +742,13 @@ async def task_manager():
 
 
 async def main():
+    """
+    main 函数是一个异步函数的定义，其中包含异步 I/O 操作（如网络请求、文件读写）。trio.run() 会一直运行，直到 main 函数及其所有子任务都完成为止。
+    处理并发任务：RAGFlow 的任务执行器需要处理来自队列的多个任务，这通常涉及到大量的 I/O 操作（从 Redis 队列读取、调用模型 API、写入数据库）。使用 trio 这样的异步框架可以高效地处理这些并发 I/O 任务，而无需使用多线程，从而减少上下文切换的开销，提高性能。
+    结构化并发：trio 提供了结构化并发的编程模型，使得编写和维护复杂的并发代码更加容易和安全。
+    """
+
+    # 打印一个 ASCII 艺术的 RAGFlow logo 到日志。
     logging.info(r"""
   ______           __      ______                     __
  /_  __/___ ______/ /__   / ____/  _____  _______  __/ /_____  _____
@@ -749,27 +756,64 @@ async def main():
  / / / /_/ (__  ) ,<    / /____>  </  __/ /__/ /_/ / /_/ /_/ / /
 /_/  \__,_/____/_/|_|  /_____/_/|_|\___/\___/\__,_/\__/\____/_/
     """)
+
+    # 打印版本信息，并初始化和打印配置设置。在服务启动时确认当前运行的版本和配置，是排查问题的第一步。确保配置正确，可以避免许多因配置错误导致的问题。
+    # 调用函数获取版本号。
     logging.info(f'TaskExecutor: RAGFlow version: {get_ragflow_version()}')
+    # 调用 settings 模块的初始化函数，通常用于从环境变量或配置文件加载和验证配置。
     settings.init_settings()
+    # 打印出当前的 RAG 相关配置，以便于调试和确认。
     print_rag_settings()
+
+    # 这段代码块用于配置和启动内存追踪工具 tracemalloc。tracemalloc 是 Python 标准库中一个强大的内存追踪工具，它能帮助开发者定位内存泄漏问题。通过信号动态控制，可以在不重启服务的情况下对内存使用情况进行诊断，这对于长时间运行的服务至关重要。
+    # 判断操作系统是否为 Windows，因为 SIGUSR1 和 SIGUSR2 是 Unix-like 系统特有的信号。
+    # SIGUSR1 信号会触发 start_tracemalloc_and_snapshot 函数，SIGUSR2 信号会触发 stop_tracemalloc。
     if sys.platform != "win32":
         signal.signal(signal.SIGUSR1, start_tracemalloc_and_snapshot)
         signal.signal(signal.SIGUSR2, stop_tracemalloc)
+    # 从环境变量中获取 TRACE_MALLOC_ENABLED 的值。
     TRACE_MALLOC_ENABLED = int(os.environ.get('TRACE_MALLOC_ENABLED', "0"))
+    # 如果该环境变量设置为 1，则在服务启动时立即开启内存追踪。
     if TRACE_MALLOC_ENABLED:
         start_tracemalloc_and_snapshot(None, None)
 
+    # 这是为终止信号 SIGINT 和 SIGTERM 注册处理函数。
+    # SIGINT 信号通常由 Ctrl+C 触发，SIGTERM 信号是 kill 命令发送的默认终止信号。
+    # 这两行代码将这些信号与一个名为 signal_handler 的函数关联起来。当服务需要停止时，它能够执行一个预定义的 signal_handler 函数来清理资源、关闭连接，并优雅地退出，而不是立即被强制终止。
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+    # ==============================================================
+    # 这是整个任务执行器的核心异步循环，负责启动状态报告和任务管理。
+    # trio 框架中的一个核心概念，它创建了一个“育儿园”（nursery）。在这个 nursery 中启动的所有子任务（start_soon）都会被自动管理。当 nursery 退出时，它会确保所有子任务都已完成或被取消。
+    # 结构化并发：trio 的 nursery 模型使得并发编程更加安全和直观。它可以自动处理子任务的生命周期和错误传播。
+    # 资源管理和任务调度：report_status 确保了服务的可监控性。task_limiter 确保了任务执行器不会因为同时处理太多任务而过载。
+    # 解耦与模块化：将状态报告、任务调度和任务处理逻辑分别封装在不同的异步函数中，使代码结构清晰，易于维护。
     async with trio.open_nursery() as nursery:
+
+        # 在后台启动一个名为 report_status 的异步任务，该任务可能定期向某个地方（如 Redis 或数据库）报告当前任务执行器的健康状态。
         nursery.start_soon(report_status)
+
+        # 这是一个无限循环，只要 stop_event（一个异步事件对象）没有被设置，循环就会一直运行。当 signal_handler 被调用时，通常会设置这个 stop_event，从而中断循环。
         while not stop_event.is_set():
+
+            # 这里使用了task_limiter，这很可能是一个并发控制机制。await 关键字会暂停循环，直到 task_limiter 允许启动新任务（例如，限制同时运行的任务数量）。
             await task_limiter.acquire()
+
+            # 当task_limiter 允许时，在后台启动一个名为 task_manager 的异步任务。task_manager 才是真正负责从队列中拉取和处理任务的核心函数。
             nursery.start_soon(task_manager)
+
+    # 一条错误日志，表示这是一个不应该被执行到的代码行。
     logging.error("BUG!!! You should not reach here!!!")
 
 if __name__ == "__main__":
+    # 这是一个 Python 标准库 faulthandler 中的函数调用。faulthandler 模块可以帮助诊断程序崩溃（例如，分段错误 segmentation fault）。
+    # faulthandler.enable() 会注册一个处理程序，当 Python 解释器检测到致命错误时，它会打印一个 Python 回溯（traceback），包括所有正在运行的线程的栈信息。
     faulthandler.enable()
+
+    # 这是一个日志初始化函数的调用，可能来自 api.utils.log_utils 模块。它的作用是配置程序的日志系统。
     init_root_logger(CONSUMER_NAME)
+
+    # 这是一个异步框架 trio 的入口点。它启动并运行整个异步应用程序。是整个任务执行器程序的起点。
+    # trio.run() 接收一个异步函数（main）作为参数。它会创建一个新的事件循环，并在该循环中执行 main 函数。
     trio.run(main)

@@ -1,5 +1,12 @@
 #!/bin/bash
 
+# 这个 shell 脚本是一个用于启动 RAGFlow 后端服务的完整管理器。它的主要职责不仅仅是启动服务，更包括：
+# 环境配置：加载环境变量并设置 Python 运行路径。
+# 优雅终止：监听终止信号，确保所有子进程都能被正确关闭。
+# 服务健壮性：为两个核心服务 task_executor.py 和 ragflow_server.py 编写了重试逻辑，以应对服务启动或运行中的短暂失败。
+# 并行启动：根据配置（WS 变量），并行启动一个或多个 task_executor 进程，以提高任务处理能力。
+# 进程管理：使用 PID 数组来跟踪所有后台进程，以便在需要时进行管理和终止。
+
 # Exit immediately if a command exits with a non-zero status
 set -e
 
