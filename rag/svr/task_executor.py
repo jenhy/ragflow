@@ -657,30 +657,70 @@ async def do_handle_task(task):
 
 
 async def handle_task():
+    """
+    这是一个异步函数，负责获取一个任务并处理它，同时处理成功、失败和无任务的情况。
+    handle_task 函数是一个非常重要的控制器。它负责获取任务、处理任务、处理任务的成功和失败状态、并最终向消息队列确认处理完成，从而构成了 RAGFlow 任务执行器中一个完整、健壮、可靠的任务处理生命周期。
+    """
+
+    # 这两行代码首先声明了两个全局变量，然后调用一个异步函数 collect() 来获取任务。
+    # 声明函数将要修改的全局变量。这些变量可能用于统计已完成和失败的任务数。
     global DONE_TASKS, FAILED_TASKS
+
+    # 调用 collect() 异步函数，并使用 await 关键字等待其返回。根据命名，collect() 很可能负责从 Redis 队列中读取一个任务。它返回两个值：redis_msg（Redis 消息对象）和 task（任务的详细内容，通常是字典形式）。
+    # 这是任务处理流程的第一步，collect() 函数封装了从队列中获取任务的复杂逻辑，保持了 handle_task 函数的整洁。
+    # 全局变量的使用是为了在整个任务执行器中跟踪任务的成功和失败状态。
     redis_msg, task = await collect()
+
+    # 这是一个检查任务是否为空的条件分支。如果 collect() 没有获取到任务（例如，队列为空），task 变量将为 None。暂停当前任务执行器 5 秒钟，让出 CPU 给其他任务，并避免在没有任务时频繁空转。直接返回，结束本次 handle_task 调用。
     if not task:
         await trio.sleep(5)
         return
     try:
+        # 打印任务开始的日志。
         logging.info(f"handle_task begin for task {json.dumps(task)}")
+
+        # 将当前任务的深拷贝（deep copy）存储在一个名为 CURRENT_TASKS 的字典中，通过任务 ID 进行索引。这可能用于追踪正在进行的任务状态。
         CURRENT_TASKS[task["id"]] = copy.deepcopy(task)
+
+        # 调用一个名为 do_handle_task 的异步函数，并等待其完成。这个函数很可能包含了所有具体的任务处理逻辑。
         await do_handle_task(task)
+
+        # 如果 do_handle_task 成功完成，增加已完成任务的计数。计数器用于提供服务状态报告。
         DONE_TASKS += 1
+
+        # 从正在进行的任务字典中移除该任务。
         CURRENT_TASKS.pop(task["id"], None)
+
+        # 打印任务完成的日志。
         logging.info(f"handle_task done for task {json.dumps(task)}")
+
+    # 用于捕获任务处理过程中可能抛出的任何异常。
+    # 确保即使任务处理失败，任务执行器也能继续运行，不会崩溃。将失败状态和错误信息写入数据库，使得前端或其他监控工具可以获知任务失败的原因，便于用户和开发者排查。确保无论成功或失败，任务都会从 CURRENT_TASKS 字典中移除。
     except Exception as e:
+
+        # 增加失败任务的计数。
         FAILED_TASKS += 1
+
+        # 即使任务失败，也要将其从正在进行的任务列表中移除。
         CURRENT_TASKS.pop(task["id"], None)
         try:
             err_msg = str(e)
+
+            # 特别处理了 trio 框架中的 ExceptionGroup 异常类型，递归地提取其中的异常信息，将其连接成一个字符串。
             while isinstance(e, exceptiongroup.ExceptionGroup):
                 e = e.exceptions[0]
                 err_msg += ' -- ' + str(e)
+
+            # 调用 set_progress 函数，将任务的状态更新为失败（-1），并记录详细的错误信息。
             set_progress(task["id"], prog=-1, msg=f"[Exception]: {err_msg}")
         except Exception:
             pass
+
+        # 打印出详细的异常日志，包括完整的栈回溯（traceback）。
         logging.exception(f"handle_task got exception for task {json.dumps(task)}")
+
+    # 确认 Redis 消息。调用从 collect() 函数获取的 Redis 消息对象的 ack() 方法。这会向 Redis 确认该消息已被成功处理。
+    # ack() 机制确保了 RAGFlow 即使在处理过程中崩溃，没有 ack 的任务也能被 Redis 重新分配给其他任务执行器，防止任务丢失。这是构建可靠的分布式任务队列的关键。
     redis_msg.ack()
 
 
@@ -735,9 +775,14 @@ async def report_status():
 
 
 async def task_manager():
+    """
+    这是一个异步函数，被 nursery.start_soon 调用，在后台运行。主要作用是提供一个健壮的框架，用于调用 handle_task，并确保在任务完成后（或失败后）正确地释放并发控制的令牌。
+    """
     try:
+        # 调用 handle_task 异步函数，并等待其完成。
         await handle_task()
     finally:
+        # 释放一个信号量或令牌，允许 main 函数中的 task_limiter.acquire() 继续执行，从而启动下一个 task_manager 任务。
         task_limiter.release()
 
 
@@ -789,6 +834,7 @@ async def main():
     # 结构化并发：trio 的 nursery 模型使得并发编程更加安全和直观。它可以自动处理子任务的生命周期和错误传播。
     # 资源管理和任务调度：report_status 确保了服务的可监控性。task_limiter 确保了任务执行器不会因为同时处理太多任务而过载。
     # 解耦与模块化：将状态报告、任务调度和任务处理逻辑分别封装在不同的异步函数中，使代码结构清晰，易于维护。
+    # ==============================================================
     async with trio.open_nursery() as nursery:
 
         # 在后台启动一个名为 report_status 的异步任务，该任务可能定期向某个地方（如 Redis 或数据库）报告当前任务执行器的健康状态。
