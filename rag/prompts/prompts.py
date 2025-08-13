@@ -27,8 +27,8 @@ from rag.settings import TAG_FLD
 from rag.utils import encoder, num_tokens_from_string
 
 
-STOP_TOKEN="<|STOP|>"
-COMPLETE_TASK="complete_task"
+STOP_TOKEN = "<|STOP|>"
+COMPLETE_TASK = "complete_task"
 
 
 def get_value(d, k1, k2):
@@ -36,7 +36,11 @@ def get_value(d, k1, k2):
 
 
 def chunks_format(reference):
-
+    """格式化检索到的原始文档块（chunks），使其结构化和标准化，以便后续使用。
+    接收一个包含原始文档块信息的字典 (reference)，并将其中的每一个文档块转换成一个标准化的字典格式。
+    参数：
+      reference: 检索到的原始文档块（chunks）
+    """
     return [
         {
             "id": get_value(chunk, "chunk_id", "id"),
@@ -57,20 +61,31 @@ def chunks_format(reference):
 
 
 def message_fit_in(msg, max_length=4000):
+    """一个用于动态截断LLM输入消息（msg）列表的函数，以确保其token总数不超过给定的max_length。
+    为什么？
+    防止LLM输入超长。LLM有严格的输入token限制。如果输入超长，模型会报错。这个函数是RAGFlow健壮性的体现，它确保了无论对话多长、检索到的文档多大，总能提供一个合法的输入给LLM。
+    保留最重要信息: system消息（提供指令）和最新的user消息（当前问题）通常是LLM生成答案最关键的上下文。这个策略优先保留这些信息，以最小化信息损失。
+    """
+
+    # 第1步：定义一个内部函数count()，用于计算消息列表中每个消息的token数，再计算总token数。
     def count():
         nonlocal msg
         tks_cnts = []
         for m in msg:
-            tks_cnts.append({"role": m["role"], "count": num_tokens_from_string(m["content"])})
+            tks_cnts.append(
+                {"role": m["role"], "count": num_tokens_from_string(m["content"])}
+            )
         total = 0
         for m in tks_cnts:
             total += m["count"]
         return total
 
+    # 第2步：如果总token数低于max_length，它直接返回。
     c = count()
     if c < max_length:
         return c, msg
 
+    # 第3步：如果超出了，它会尝试一个截断策略：只保留system消息和最后一条消息（通常是用户问题）。这是一种优先保留最重要上下文的常用策略。
     msg_ = [m for m in msg if m["role"] == "system"]
     if len(msg) > 1:
         msg_.append(msg[-1])
@@ -79,6 +94,7 @@ def message_fit_in(msg, max_length=4000):
     if c < max_length:
         return c, msg
 
+    # 第4步：如果截断后仍然超出max_length，它会更进一步：根据system消息和最后一条user消息的长度比例，按比例截断更长的那条消息，直到总token数满足要求。
     ll = num_tokens_from_string(msg_[0]["content"])
     ll2 = num_tokens_from_string(msg_[-1]["content"])
     if ll / (ll + ll2) > 0.8:
@@ -94,12 +110,16 @@ def message_fit_in(msg, max_length=4000):
 
 
 def kb_prompt(kbinfos, max_tokens, hash_id=False):
+    """用于将检索到的知识库信息（kbinfos）格式化成LLM可读的字符串，并控制其长度。"""
     from api.db.services.document_service import DocumentService
 
-    knowledges = [get_value(ck, "content", "content_with_weight") for ck in kbinfos["chunks"]]
+    knowledges = [
+        get_value(ck, "content", "content_with_weight") for ck in kbinfos["chunks"]
+    ]
     kwlg_len = len(knowledges)
     used_token_count = 0
     chunks_num = 0
+    # 第1步：遍历检索到的文档块，计算它们的总token数。如果超出max_tokens限制，它会截断文档块列表，只保留最相关的一部分。
     for i, c in enumerate(knowledges):
         if not c:
             continue
@@ -107,10 +127,17 @@ def kb_prompt(kbinfos, max_tokens, hash_id=False):
         chunks_num += 1
         if max_tokens * 0.97 < used_token_count:
             knowledges = knowledges[:i]
-            logging.warning(f"Not all the retrieval into prompt: {len(knowledges)}/{kwlg_len}")
+            logging.warning(
+                f"Not all the retrieval into prompt: {len(knowledges)}/{kwlg_len}"
+            )
             break
-
-    docs = DocumentService.get_by_ids([get_value(ck, "doc_id", "document_id") for ck in kbinfos["chunks"][:chunks_num]])
+    # 第2步：从数据库服务中获取文档元数据（DocumentService），这使得增强内容不仅包含文档块内容，还包括标题、URL等元数据。
+    docs = DocumentService.get_by_ids(
+        [
+            get_value(ck, "doc_id", "document_id")
+            for ck in kbinfos["chunks"][:chunks_num]
+        ]
+    )
     docs = {d.id: d.meta_fields for d in docs}
 
     def draw_node(k, line):
@@ -119,10 +146,14 @@ def kb_prompt(kbinfos, max_tokens, hash_id=False):
         return f"\n├── {k}: " + re.sub(r"\n+", " ", line, flags=re.DOTALL)
 
     knowledges = []
+    # 第3步：将每一个文档块格式化成一个带有ID、标题、URL和内容的字符串。
+    # 第4步：如果hash_id为真，它还会对文档块ID进行哈希处理，这在需要保护原始ID或使其更短时很有用。
     for i, ck in enumerate(kbinfos["chunks"][:chunks_num]):
-        cnt = "\nID: {}".format(i if not hash_id else hash_str2int(get_value(ck, "id", "chunk_id"), 100))
+        cnt = "\nID: {}".format(
+            i if not hash_id else hash_str2int(get_value(ck, "id", "chunk_id"), 100)
+        )
         cnt += draw_node("Title", get_value(ck, "docnm_kwd", "document_name"))
-        cnt += draw_node("URL", ck['url'])  if "url" in ck else ""
+        cnt += draw_node("URL", ck["url"]) if "url" in ck else ""
         for k, v in docs.get(get_value(ck, "doc_id", "document_id"), {}).items():
             cnt += draw_node(k, v)
         cnt += "\n└── Content:\n"
@@ -150,7 +181,9 @@ REFLECT = load_prompt("reflect")
 SUMMARY4MEMORY = load_prompt("summary4memory")
 RANK_MEMORY = load_prompt("rank_memory")
 
-PROMPT_JINJA_ENV = jinja2.Environment(autoescape=False, trim_blocks=True, lstrip_blocks=True)
+PROMPT_JINJA_ENV = jinja2.Environment(
+    autoescape=False, trim_blocks=True, lstrip_blocks=True
+)
 
 
 def citation_prompt() -> str:
@@ -164,10 +197,14 @@ def citation_plus(sources: str) -> str:
 
 
 def keyword_extraction(chat_mdl, content, topn=3):
+    """利用LLM进行关键词提取的函数。"""
     template = PROMPT_JINJA_ENV.from_string(KEYWORD_PROMPT_TEMPLATE)
     rendered_prompt = template.render(content=content, topn=topn)
 
-    msg = [{"role": "system", "content": rendered_prompt}, {"role": "user", "content": "Output: "}]
+    msg = [
+        {"role": "system", "content": rendered_prompt},
+        {"role": "user", "content": "Output: "},
+    ]
     _, msg = message_fit_in(msg, chat_mdl.max_length)
     kwd = chat_mdl.chat(rendered_prompt, msg[1:], {"temperature": 0.2})
     if isinstance(kwd, tuple):
@@ -179,10 +216,14 @@ def keyword_extraction(chat_mdl, content, topn=3):
 
 
 def question_proposal(chat_mdl, content, topn=3):
+    """利用LLM根据给定的内容生成相关问题的函数。"""
     template = PROMPT_JINJA_ENV.from_string(QUESTION_PROMPT_TEMPLATE)
     rendered_prompt = template.render(content=content, topn=topn)
 
-    msg = [{"role": "system", "content": rendered_prompt}, {"role": "user", "content": "Output: "}]
+    msg = [
+        {"role": "system", "content": rendered_prompt},
+        {"role": "user", "content": "Output: "},
+    ]
     _, msg = message_fit_in(msg, chat_mdl.max_length)
     kwd = chat_mdl.chat(rendered_prompt, msg[1:], {"temperature": 0.2})
     if isinstance(kwd, tuple):
@@ -193,7 +234,10 @@ def question_proposal(chat_mdl, content, topn=3):
     return kwd
 
 
-def full_question(tenant_id=None, llm_id=None, messages=[], language=None, chat_mdl=None):
+def full_question(
+    tenant_id=None, llm_id=None, messages=[], language=None, chat_mdl=None
+):
+    """一个将多轮对话历史总结成一个完整问题的函数。"""
     from api.db import LLMType
     from api.db.services.llm_service import LLMBundle
     from api.db.services.llm_service import TenantLLMService
@@ -228,6 +272,7 @@ def full_question(tenant_id=None, llm_id=None, messages=[], language=None, chat_
 
 
 def cross_languages(tenant_id, llm_id, query, languages=[]):
+    """一个利用LLM进行跨语言翻译的函数，特别是将查询翻译成多个目标语言。"""
     from api.db import LLMType
     from api.db.services.llm_service import LLMBundle
     from api.db.services.llm_service import TenantLLMService
@@ -237,17 +282,32 @@ def cross_languages(tenant_id, llm_id, query, languages=[]):
     else:
         chat_mdl = LLMBundle(tenant_id, LLMType.CHAT, llm_id)
 
-    rendered_sys_prompt = PROMPT_JINJA_ENV.from_string(CROSS_LANGUAGES_SYS_PROMPT_TEMPLATE).render()
-    rendered_user_prompt = PROMPT_JINJA_ENV.from_string(CROSS_LANGUAGES_USER_PROMPT_TEMPLATE).render(query=query, languages=languages)
+    rendered_sys_prompt = PROMPT_JINJA_ENV.from_string(
+        CROSS_LANGUAGES_SYS_PROMPT_TEMPLATE
+    ).render()
+    rendered_user_prompt = PROMPT_JINJA_ENV.from_string(
+        CROSS_LANGUAGES_USER_PROMPT_TEMPLATE
+    ).render(query=query, languages=languages)
 
-    ans = chat_mdl.chat(rendered_sys_prompt, [{"role": "user", "content": rendered_user_prompt}], {"temperature": 0.2})
+    ans = chat_mdl.chat(
+        rendered_sys_prompt,
+        [{"role": "user", "content": rendered_user_prompt}],
+        {"temperature": 0.2},
+    )
     ans = re.sub(r"^.*</think>", "", ans, flags=re.DOTALL)
     if ans.find("**ERROR**") >= 0:
         return query
-    return "\n".join([a for a in re.sub(r"(^Output:|\n+)", "", ans, flags=re.DOTALL).split("===") if a.strip()])
+    return "\n".join(
+        [
+            a
+            for a in re.sub(r"(^Output:|\n+)", "", ans, flags=re.DOTALL).split("===")
+            if a.strip()
+        ]
+    )
 
 
 def content_tagging(chat_mdl, content, all_tags, examples, topn=3):
+    """一个利用LLM给一段文本内容打标签的函数。"""
     template = PROMPT_JINJA_ENV.from_string(CONTENT_TAGGING_PROMPT_TEMPLATE)
 
     for ex in examples:
@@ -260,7 +320,10 @@ def content_tagging(chat_mdl, content, all_tags, examples, topn=3):
         content=content,
     )
 
-    msg = [{"role": "system", "content": rendered_prompt}, {"role": "user", "content": "Output: "}]
+    msg = [
+        {"role": "system", "content": rendered_prompt},
+        {"role": "user", "content": "Output: "},
+    ]
     _, msg = message_fit_in(msg, chat_mdl.max_length)
     kwd = chat_mdl.chat(rendered_prompt, msg[1:], {"temperature": 0.5})
     if isinstance(kwd, tuple):
@@ -273,7 +336,12 @@ def content_tagging(chat_mdl, content, all_tags, examples, topn=3):
         obj = json_repair.loads(kwd)
     except json_repair.JSONDecodeError:
         try:
-            result = kwd.replace(rendered_prompt[:-1], "").replace("user", "").replace("model", "").strip()
+            result = (
+                kwd.replace(rendered_prompt[:-1], "")
+                .replace("user", "")
+                .replace("model", "")
+                .strip()
+            )
             result = "{" + result.split("{")[1].split("}")[0] + "}"
             obj = json_repair.loads(result)
         except Exception as e:
@@ -312,15 +380,25 @@ def tool_schema(tools_description: list[dict], complete_task=False):
                 "description": "When you have the final answer and are ready to complete the task, call this function with your answer",
                 "parameters": {
                     "type": "object",
-                    "properties": {"answer":{"type":"string", "description": "The final answer to the user's question"}},
-                    "required": ["answer"]
-                }
-            }
+                    "properties": {
+                        "answer": {
+                            "type": "string",
+                            "description": "The final answer to the user's question",
+                        }
+                    },
+                    "required": ["answer"],
+                },
+            },
         }
     for tool in tools_description:
         desc[tool["function"]["name"]] = tool
 
-    return "\n\n".join([f"## {i+1}. {fnm}\n{json.dumps(des, ensure_ascii=False, indent=4)}" for i, (fnm, des) in enumerate(desc.items())])
+    return "\n\n".join(
+        [
+            f"## {i+1}. {fnm}\n{json.dumps(des, ensure_ascii=False, indent=4)}"
+            for i, (fnm, des) in enumerate(desc.items())
+        ]
+    )
 
 
 def form_history(history, limit=-6):
@@ -329,7 +407,7 @@ def form_history(history, limit=-6):
         if h["role"] == "system":
             continue
         role = "USER"
-        if h["role"].upper()!= role:
+        if h["role"].upper() != role:
             role = "AGENT"
         context += f"\n{role}: {h['content'][:2048] + ('...' if len(h['content'])>2048 else '')}"
     return context
@@ -341,7 +419,18 @@ def analyze_task(chat_mdl, task_name, tools_description: list[dict]):
 
     template = PROMPT_JINJA_ENV.from_string(ANALYZE_TASK_USER)
 
-    kwd = chat_mdl.chat(ANALYZE_TASK_SYSTEM,[{"role": "user", "content": template.render(task=task_name, context=context, tools_desc=tools_desc)}], {})
+    kwd = chat_mdl.chat(
+        ANALYZE_TASK_SYSTEM,
+        [
+            {
+                "role": "user",
+                "content": template.render(
+                    task=task_name, context=context, tools_desc=tools_desc
+                ),
+            }
+        ],
+        {},
+    )
     if isinstance(kwd, tuple):
         kwd = kwd[0]
     kwd = re.sub(r"^.*</think>", "", kwd, flags=re.DOTALL)
@@ -350,7 +439,7 @@ def analyze_task(chat_mdl, task_name, tools_description: list[dict]):
     return kwd
 
 
-def next_step(chat_mdl, history:list, tools_description: list[dict], task_desc):
+def next_step(chat_mdl, history: list, tools_description: list[dict], task_desc):
     if not tools_description:
         return ""
     desc = tool_schema(tools_description)
@@ -361,8 +450,15 @@ def next_step(chat_mdl, history:list, tools_description: list[dict], task_desc):
         hist[-1]["content"] += user_prompt
     else:
         hist.append({"role": "user", "content": user_prompt})
-    json_str = chat_mdl.chat(template.render(task_analisys=task_desc, desc=desc, today=datetime.datetime.now().strftime("%Y-%m-%d")),
-                             hist[1:], stop=["<|stop|>"])
+    json_str = chat_mdl.chat(
+        template.render(
+            task_analisys=task_desc,
+            desc=desc,
+            today=datetime.datetime.now().strftime("%Y-%m-%d"),
+        ),
+        hist[1:],
+        stop=["<|stop|>"],
+    )
     tk_cnt = num_tokens_from_string(json_str)
     json_str = re.sub(r"^.*</think>", "", json_str, flags=re.DOTALL)
     return json_str, tk_cnt
@@ -387,29 +483,43 @@ def reflect(chat_mdl, history: list[dict], tool_call_res: list[Tuple]):
 
 **Reflection**
 {}
-    """.format(json.dumps(tool_calls, ensure_ascii=False, indent=2), ans)
+    """.format(
+        json.dumps(tool_calls, ensure_ascii=False, indent=2), ans
+    )
 
 
 def form_message(system_prompt, user_prompt):
-    return [{"role": "system", "content": system_prompt},{"role": "user", "content": user_prompt}]
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
 
 def tool_call_summary(chat_mdl, name: str, params: dict, result: str) -> str:
     template = PROMPT_JINJA_ENV.from_string(SUMMARY4MEMORY)
-    system_prompt = template.render(name=name,
-                           params=json.dumps(params, ensure_ascii=False, indent=2),
-                           result=result)
+    system_prompt = template.render(
+        name=name,
+        params=json.dumps(params, ensure_ascii=False, indent=2),
+        result=result,
+    )
     user_prompt = "→ Summary: "
-    _, msg = message_fit_in(form_message(system_prompt, user_prompt), chat_mdl.max_length)
+    _, msg = message_fit_in(
+        form_message(system_prompt, user_prompt), chat_mdl.max_length
+    )
     ans = chat_mdl.chat(msg[0]["content"], msg[1:])
     return re.sub(r"^.*</think>", "", ans, flags=re.DOTALL)
 
 
-def rank_memories(chat_mdl, goal:str, sub_goal:str, tool_call_summaries: list[str]):
+def rank_memories(chat_mdl, goal: str, sub_goal: str, tool_call_summaries: list[str]):
     template = PROMPT_JINJA_ENV.from_string(RANK_MEMORY)
-    system_prompt = template.render(goal=goal, sub_goal=sub_goal, results=[{"i": i, "content": s} for i,s in enumerate(tool_call_summaries)])
+    system_prompt = template.render(
+        goal=goal,
+        sub_goal=sub_goal,
+        results=[{"i": i, "content": s} for i, s in enumerate(tool_call_summaries)],
+    )
     user_prompt = " → rank: "
-    _, msg = message_fit_in(form_message(system_prompt, user_prompt), chat_mdl.max_length)
+    _, msg = message_fit_in(
+        form_message(system_prompt, user_prompt), chat_mdl.max_length
+    )
     ans = chat_mdl.chat(msg[0]["content"], msg[1:], stop="<|stop|>")
     return re.sub(r"^.*</think>", "", ans, flags=re.DOTALL)
-
